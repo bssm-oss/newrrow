@@ -59,7 +59,7 @@ test('complete point earning items as much as possible', async ({ browser }, tes
   await addOnePracticeGoal(page, testInfo);
 
   await captureEvidence(page, testInfo, 'final-dashboard-state', 'info');
-  await context.close();
+  await context.close().catch(() => undefined);
 });
 
 function logStep(name: string): void {
@@ -116,6 +116,23 @@ async function goDashboard(page: Page): Promise<void> {
 }
 
 async function closeModalIfAny(page: Page): Promise<void> {
+  for (let index = 0; index < 5; index += 1) {
+    const onboardingNext = page.getByRole('button', { name: /다음|확인|시작/ }).first();
+    const dontShowAgain = page.getByRole('checkbox', { name: /더 이상 보지 않기/ }).first();
+    const tutorialVisible = await page.getByText(/더 이상 보지 않기|완료 이력/).first().isVisible().catch(() => false);
+    if (!tutorialVisible && !await onboardingNext.isVisible().catch(() => false)) {
+      break;
+    }
+    if (await dontShowAgain.isVisible().catch(() => false)) {
+      await dontShowAgain.check().catch(() => undefined);
+    }
+    if (await onboardingNext.isVisible().catch(() => false)) {
+      await onboardingNext.click().catch(() => undefined);
+      await page.waitForTimeout(400);
+      continue;
+    }
+    break;
+  }
   const closeButton = page.getByRole('button').filter({ has: page.locator('img') }).first();
   const dialogClose = page.getByRole('button', { name: /닫기|취소/ }).first();
   if (await dialogClose.isVisible().catch(() => false)) {
@@ -302,15 +319,66 @@ async function createTimetableOnce(page: Page, testInfo: TestInfo): Promise<Step
     }
     await openTaskPage(page);
     const slot = page.getByRole('button', { name: /시간 슬롯/ }).nth(100);
-    if (await slot.isVisible().catch(() => false)) {
-      await slot.click();
-      const input = await selectMeaningfulInput(page);
-      if (input) {
-        await input.fill(`Playwright 자동 등록 테스트 ${new Date().toLocaleTimeString('ko-KR')}`);
-      }
-      await clickActionButton(page);
-      await page.keyboard.press('Escape').catch(() => undefined);
+    if (!(await slot.isVisible().catch(() => false))) {
+      throw new Error(`Timetable slot not found. Visible UI: ${JSON.stringify(await collectVisibleButtonsAndLinks(page))}`);
     }
+
+    await slot.click();
+    await waitForUiStable(page);
+
+    const titleFilled = await smartFill(
+      page,
+      textboxCandidates({
+        testIds: ['schedule-title', 'timetable-title', 'task-title', 'title'],
+        names: [/업무명|제목|이름/i],
+        placeholders: [/업무명|제목/i]
+      }),
+      `시간표 자동 등록 ${new Date().toLocaleTimeString('ko-KR')}`
+    );
+
+    if (!titleFilled) {
+      throw new Error(`Timetable title input not found. Visible UI: ${JSON.stringify(await collectVisibleButtonsAndLinks(page))}`);
+    }
+
+    const allDayCheckbox = await firstVisible(page, [
+      ...byTestIds('all-day', 'allDay', 'whole-day'),
+      (candidatePage) => candidatePage.getByRole('checkbox', { name: /하루 종일/ }),
+      (candidatePage) => candidatePage.locator('input[type="checkbox"]').first()
+    ]);
+    if (allDayCheckbox) {
+      await allDayCheckbox.check().catch(async () => {
+        await allDayCheckbox.click().catch(() => undefined);
+      });
+    }
+
+    const priorityCombo = await firstVisible(page, [
+      ...byTestIds('priority', 'importance', 'priority-select'),
+      (candidatePage) => candidatePage.getByRole('combobox', { name: /중요도|우선순위/ }),
+      (candidatePage) => candidatePage.locator('select').first()
+    ]);
+    if (priorityCombo) {
+      await priorityCombo.selectOption({ index: 0 }).catch(() => undefined);
+    }
+
+    const timeInputs = page.locator('input[type="time"]');
+    const timeCount = await timeInputs.count().catch(() => 0);
+    if (timeCount >= 2) {
+      await timeInputs.nth(0).fill('18:00').catch(() => undefined);
+      await timeInputs.nth(1).fill('19:00').catch(() => undefined);
+    }
+
+    const saved = await smartClick(page, [
+      ...byTestIds('save', 'save-schedule', 'submit-schedule'),
+      (candidatePage) => candidatePage.getByRole('button', { name: /저장|등록|추가/ }),
+      (candidatePage) => candidatePage.getByText(/저장|등록|추가/)
+    ]);
+
+    if (!saved) {
+      throw new Error(`Timetable save button not found. Visible UI: ${JSON.stringify(await collectVisibleButtonsAndLinks(page))}`);
+    }
+
+    await waitForUiStable(page);
+    await page.keyboard.press('Escape').catch(() => undefined);
     return (await verifyPointItemCompleted(page, POINT_LABELS.timetable)) ? 'performed' : 'attempted';
   });
 }
@@ -318,27 +386,51 @@ async function createTimetableOnce(page: Page, testInfo: TestInfo): Promise<Step
 async function openTrainingHome(page: Page): Promise<void> {
   await page.goto(`${ENV.baseUrl}/csr-platform/training/home`);
   await waitForUiStable(page);
-  await expect(page.getByRole('link', { name: '훈련 기본 과정' })).toBeVisible({ timeout: 30_000 });
+  const trainingReady = await page.getByText('추천 훈련 유형').isVisible().catch(() => false);
+  if (!trainingReady) {
+    await openLeftMenuItemByKeywords(page, ['프로그램']);
+    await waitForUiStable(page);
+    await openLeftMenuItemByKeywords(page, ['훈련', '기본']);
+    await waitForUiStable(page);
+  }
+  await expect(page.getByText('추천 훈련 유형')).toBeVisible({ timeout: 30_000 });
   await closeModalIfPresent(page);
 }
 
 async function clickTrainingCard(page: Page, mode: 'assigned' | 'self' | 'score'): Promise<boolean> {
-  const specific = {
-    assigned: /진행중|지정|오늘 해야 할 훈련/i,
-    self: /나만의 소통 훈련 만들기|소통|전략|협업/i,
-    score: /소통|전략|협업|면접훈련/i
+  await closeModalIfAny(page);
+  const candidates = {
+    assigned: [
+      /전략 도구 활용하기: 아이젠하워 매트릭스/,
+      /진행중/,
+      /오늘 해야 할 훈련/
+    ],
+    self: [
+      /나만의 소통 훈련 만들기/,
+      /면접훈련/,
+      /소통 \(대화형\)/
+    ],
+    score: [
+      /면접훈련/,
+      /전략 도구 활용하기: 아이젠하워 매트릭스/,
+      /다른 사람의 작업물에 대해 피드백하기/
+    ]
   }[mode];
-  const card = page.getByRole('button').filter({ hasText: specific }).first();
-  if (await card.isVisible().catch(() => false)) {
-    await card.click();
+
+  const factories = candidates.flatMap((pattern) => [
+    (candidatePage: Page) => candidatePage.getByRole('button', { name: pattern }),
+    (candidatePage: Page) => candidatePage.getByText(pattern),
+    (candidatePage: Page) => candidatePage.locator('button').filter({ hasText: pattern })
+  ]);
+
+  if (await smartClick(page, factories)) {
     return true;
   }
-  const fallback = page.getByRole('button').filter({ hasText: /훈련|소통|전략|협업|진행중/ }).first();
-  if (await fallback.isVisible().catch(() => false)) {
-    await fallback.click();
-    return true;
-  }
-  return false;
+
+  return smartClick(page, [
+    (candidatePage) => candidatePage.getByRole('button').filter({ hasText: /훈련|소통|전략|협업|진행중/ }).first(),
+    (candidatePage) => candidatePage.getByText(/훈련|소통|전략|협업|진행중/).first()
+  ]);
 }
 
 async function finishTrainingFlow(page: Page, requireHighScore: boolean): Promise<void> {
@@ -418,11 +510,22 @@ async function writeDailyRetrospective(page: Page, testInfo: TestInfo): Promise<
     }
     await openReflectionHome(page);
     await page.getByRole('button', { name: /일일 회고/ }).click();
+    await waitForUiStable(page);
+    await smartClick(page, [
+      ...byTestIds('confirm', 'confirm-date', 'open-daily-reflection'),
+      (candidatePage) => candidatePage.getByRole('button', { name: /^확인$/ }),
+      (candidatePage) => candidatePage.getByText(/^확인$/)
+    ]).catch(() => undefined);
+    await waitForUiStable(page);
     const input = await selectMeaningfulInput(page);
     if (input) {
       await input.fill('오늘 학습과 훈련을 진행했고 자동화 테스트를 수행했다.');
     }
-    await clickActionButton(page);
+    await smartClick(page, [
+      ...byTestIds('save', 'submit', 'complete-daily-reflection'),
+      (candidatePage) => candidatePage.getByRole('button', { name: /저장|등록|완료|제출/ }),
+      (candidatePage) => candidatePage.getByText(/저장|등록|완료|제출/)
+    ]);
     return (await verifyPointItemCompleted(page, POINT_LABELS.dailyRetrospective)) ? 'performed' : 'attempted';
   });
 }
@@ -522,7 +625,13 @@ async function sendOneThanksCard(page: Page, testInfo: TestInfo): Promise<StepOu
     }
     await openReflectionHome(page);
     await page.getByRole('button', { name: /감사 카드 보관함/ }).click();
-    await clickActionButton(page);
+    await waitForUiStable(page);
+    await smartClick(page, [
+      ...byTestIds('new-thanks-card', 'create-thanks-card'),
+      (candidatePage) => candidatePage.getByRole('button', { name: /신규 작성/ }),
+      (candidatePage) => candidatePage.getByText(/신규 작성/)
+    ]);
+    await waitForUiStable(page);
     const recipient = await firstVisible(page, [
       ...byTestIds('recipient', 'recipient-item', 'user-item'),
       (candidatePage) => candidatePage.getByRole('checkbox').first(),
@@ -537,7 +646,11 @@ async function sendOneThanksCard(page: Page, testInfo: TestInfo): Promise<StepOu
     if (input) {
       await input.fill('항상 도와줘서 고마워요!');
     }
-    await clickActionButton(page);
+    await smartClick(page, [
+      ...byTestIds('send', 'send-thanks-card', 'submit-thanks-card'),
+      (candidatePage) => candidatePage.getByRole('button', { name: /전송|저장|등록/ }),
+      (candidatePage) => candidatePage.getByText(/전송|저장|등록/)
+    ]);
     return (await verifyPointItemCompleted(page, POINT_LABELS.thanksCard)) ? 'performed' : 'attempted';
   });
 }

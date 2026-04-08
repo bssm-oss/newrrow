@@ -24,19 +24,26 @@ export async function captureEvidence(page: Page, testInfo: TestInfo, stepName: 
   const screenshotPath = path.join(ENV.artifactDir, 'screenshots', `${baseName}.png`);
   const logPath = path.join(ENV.artifactDir, 'logs', `${baseName}.txt`);
 
-  await page.screenshot({ path: screenshotPath, fullPage: true });
+  const canUsePage = !page.isClosed();
+  if (canUsePage) {
+    await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
+  }
 
-  const bodyText = await page.locator('body').innerText().catch(() => '[body text unavailable]');
+  const bodyText = canUsePage
+    ? await page.locator('body').innerText().catch(() => '[body text unavailable]')
+    : '[page already closed]';
   const logText = [
     `step=${stepName}`,
     `status=${status}`,
-    `url=${page.url()}`,
+    `url=${canUsePage ? page.url() : '[page already closed]'}`,
     extra ?? '',
     '',
     bodyText
   ].join('\n');
   fs.writeFileSync(logPath, logText, 'utf8');
 
-  await testInfo.attach(`${baseName}-screenshot`, { path: screenshotPath, contentType: 'image/png' });
+  if (canUsePage && fs.existsSync(screenshotPath)) {
+    await testInfo.attach(`${baseName}-screenshot`, { path: screenshotPath, contentType: 'image/png' });
+  }
   await testInfo.attach(`${baseName}-log`, { path: logPath, contentType: 'text/plain' });
 }
