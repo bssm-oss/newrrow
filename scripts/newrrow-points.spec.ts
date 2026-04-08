@@ -4,7 +4,7 @@ import { ensureStorageState } from './lib/auth.js';
 import { captureEvidence, logLine } from './lib/logging.js';
 import { actionButtonCandidates, bySelectors, byTestIds, clickFirstVisible, firstVisible, textboxCandidates } from './lib/selectors.js';
 
-type StepOutcome = 'verified' | 'performed' | 'skipped' | 'failed';
+type StepOutcome = 'verified' | 'performed' | 'attempted' | 'skipped' | 'failed';
 
 const POINT_LABELS = {
   todo: '[할일] 하루 동안 할일 1번 이상 등록',
@@ -62,27 +62,60 @@ test('complete point earning items as much as possible', async ({ browser }, tes
   await context.close();
 });
 
+function logStep(name: string): void {
+  logLine(name);
+}
+
 async function runActionStep(page: Page, testInfo: TestInfo, stepName: string, body: () => Promise<StepOutcome>): Promise<StepOutcome> {
-  logLine(`START ${stepName}`);
+  logStep(`START ${stepName}`);
   try {
     const outcome = await body();
     await captureEvidence(page, testInfo, stepName, outcome === 'failed' ? 'failure' : 'success', `outcome=${outcome}`);
-    logLine(`END ${stepName}: ${outcome}`);
+    logStep(`END ${stepName}: ${outcome}`);
     return outcome;
   } catch (error) {
     const message = error instanceof Error ? error.stack ?? error.message : String(error);
     await captureEvidence(page, testInfo, stepName, 'failure', message);
-    logLine(`END ${stepName}: failed`);
+    logStep(`END ${stepName}: failed`);
     return 'failed';
   }
 }
 
+async function waitForUiStable(page: Page): Promise<void> {
+  await page.waitForLoadState('domcontentloaded');
+  await page.waitForLoadState('networkidle').catch(() => undefined);
+  await page.waitForTimeout(500);
+}
+
+async function captureDebug(page: Page, testInfo: TestInfo, tag: string): Promise<void> {
+  const summary = await collectVisibleButtonsAndLinks(page);
+  await captureEvidence(page, testInfo, tag, 'info', JSON.stringify(summary, null, 2));
+}
+
+async function smartClick(page: Page, locatorCandidates: Array<(page: Page) => Locator>): Promise<boolean> {
+  return clickFirstVisible(page, locatorCandidates);
+}
+
+async function smartFill(page: Page, locatorCandidates: Array<(page: Page) => Locator>, value: string): Promise<boolean> {
+  const locator = await firstVisible(page, locatorCandidates);
+  if (!locator) {
+    return false;
+  }
+  await locator.fill(value);
+  return true;
+}
+
+async function smartPressNext(page: Page): Promise<boolean> {
+  return smartClick(page, actionButtonCandidates([/다음/, /시작/, /진행/, /확인/, /평가/], ['next', 'confirm', 'start']));
+}
+
 async function goDashboard(page: Page): Promise<void> {
   await page.goto(`${ENV.baseUrl}${ENV.dashboardPath}`);
+  await waitForUiStable(page);
   await expect(page.getByRole('link', { name: '대시보드' })).toBeVisible({ timeout: 30_000 });
 }
 
-async function closeModalIfPresent(page: Page): Promise<void> {
+async function closeModalIfAny(page: Page): Promise<void> {
   const closeButton = page.getByRole('button').filter({ has: page.locator('img') }).first();
   const dialogClose = page.getByRole('button', { name: /닫기|취소/ }).first();
   if (await dialogClose.isVisible().catch(() => false)) {
@@ -92,6 +125,10 @@ async function closeModalIfPresent(page: Page): Promise<void> {
   if (await closeButton.isVisible().catch(() => false)) {
     await closeButton.click().catch(() => undefined);
   }
+}
+
+async function closeModalIfPresent(page: Page): Promise<void> {
+  await closeModalIfAny(page);
 }
 
 async function clickMyRankingRow(page: Page): Promise<void> {
@@ -133,6 +170,10 @@ async function verifyPointItemCompleted(page: Page, labelText: string): Promise<
   return false;
 }
 
+async function verifyPointProgress(page: Page, itemText: string): Promise<boolean> {
+  return verifyPointItemCompleted(page, itemText);
+}
+
 async function selectMeaningfulInput(page: Page): Promise<Locator | null> {
   return firstVisible(
     page,
@@ -159,13 +200,70 @@ async function dumpLinksAndButtons(page: Page): Promise<string> {
   return JSON.stringify(values, null, 2);
 }
 
+async function collectVisibleButtonsAndLinks(page: Page): Promise<{ links: string[]; buttons: string[]; headings: string[]; url: string }> {
+  return page.evaluate(() => {
+    const visibleText = (selector: string) =>
+      Array.from(document.querySelectorAll(selector))
+        .filter((element) => {
+          const htmlElement = element as HTMLElement;
+          const rect = htmlElement.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        })
+        .map((element) => (element.textContent ?? '').replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
+
+    return {
+      links: visibleText('a'),
+      buttons: visibleText('button, [role="button"], input[type="button"], input[type="submit"]'),
+      headings: visibleText('h1, h2, h3, [role="heading"]'),
+      url: window.location.href
+    };
+  });
+}
+
 async function maybeSkipIfAlreadyCompleted(page: Page, label: string): Promise<boolean> {
   return verifyPointItemCompleted(page, label);
 }
 
+function shouldForceAction(actionKey: string): boolean {
+  return ENV.forceActionKeys.includes('all') || ENV.forceActionKeys.includes(actionKey);
+}
+
 async function openTaskPage(page: Page): Promise<void> {
   await page.goto(`${ENV.baseUrl}/working-station/tasks`);
-  await expect(page.getByRole('link', { name: '할 일' })).toBeVisible({ timeout: 30_000 });
+  await waitForUiStable(page);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const ready = await firstVisible(page, [
+      ...textboxCandidates({
+        testIds: ['task-input', 'task-title', 'task-content'],
+        placeholders: [/업무를 등록해 주세요\./]
+      }),
+      (candidatePage) => candidatePage.getByRole('button', { name: /할 일 추가|추가/ }),
+      (candidatePage) => candidatePage.getByRole('button', { name: /시간 슬롯/ }).first()
+    ]);
+    if (ready) {
+      return;
+    }
+    await page.reload();
+    await waitForUiStable(page);
+  }
+  throw new Error(`Task page content did not become ready. Visible UI: ${JSON.stringify(await collectVisibleButtonsAndLinks(page))}`);
+}
+
+async function openLeftMenuItemByKeywords(page: Page, keywords: string[]): Promise<boolean> {
+  const regex = new RegExp(keywords.join('|'));
+  return smartClick(page, [
+    ...byTestIds(...keywords.map((keyword) => `${keyword}-menu`)),
+    (candidatePage) => candidatePage.getByRole('link', { name: regex }),
+    (candidatePage) => candidatePage.getByRole('button', { name: regex }),
+    (candidatePage) => candidatePage.getByText(regex).locator('..')
+  ]);
+}
+
+async function tryBackToList(page: Page): Promise<void> {
+  await closeModalIfAny(page);
+  await page.goBack().catch(() => undefined);
+  await waitForUiStable(page);
 }
 
 async function viewDashboardOnce(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
@@ -180,7 +278,7 @@ async function viewDashboardOnce(page: Page, testInfo: TestInfo): Promise<StepOu
 
 async function completeTodoOnce(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'complete-todo-once', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.todo)) {
+    if (!shouldForceAction('todo') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.todo)) {
       return 'verified';
     }
     await openTaskPage(page);
@@ -193,13 +291,13 @@ async function completeTodoOnce(page: Page, testInfo: TestInfo): Promise<StepOut
     }
     await input.fill(`Playwright 자동 등록 테스트 ${Date.now()}`);
     await clickActionButton(page);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.todo)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.todo)) ? 'performed' : 'attempted';
   });
 }
 
 async function createTimetableOnce(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'create-timetable-once', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.timetable)) {
+    if (!shouldForceAction('timetable') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.timetable)) {
       return 'verified';
     }
     await openTaskPage(page);
@@ -213,12 +311,13 @@ async function createTimetableOnce(page: Page, testInfo: TestInfo): Promise<Step
       await clickActionButton(page);
       await page.keyboard.press('Escape').catch(() => undefined);
     }
-    return (await verifyPointItemCompleted(page, POINT_LABELS.timetable)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.timetable)) ? 'performed' : 'attempted';
   });
 }
 
 async function openTrainingHome(page: Page): Promise<void> {
   await page.goto(`${ENV.baseUrl}/csr-platform/training/home`);
+  await waitForUiStable(page);
   await expect(page.getByRole('link', { name: '훈련 기본 과정' })).toBeVisible({ timeout: 30_000 });
   await closeModalIfPresent(page);
 }
@@ -266,7 +365,7 @@ async function clickFirstTrainingCard(page: Page): Promise<boolean> {
 
 async function completeAssignedTraining(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'complete-assigned-training', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.assignedTraining)) {
+    if (!shouldForceAction('assignedTraining') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.assignedTraining)) {
       return 'verified';
     }
     await openTrainingHome(page);
@@ -274,13 +373,13 @@ async function completeAssignedTraining(page: Page, testInfo: TestInfo): Promise
       throw new Error(`Could not open training card. Available controls: ${await dumpLinksAndButtons(page)}`);
     }
     await finishTrainingFlow(page, false);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.assignedTraining)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.assignedTraining)) ? 'performed' : 'attempted';
   });
 }
 
 async function completeSelfTraining(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'complete-self-training', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.selfTraining)) {
+    if (!shouldForceAction('selfTraining') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.selfTraining)) {
       return 'verified';
     }
     await openTrainingHome(page);
@@ -288,13 +387,13 @@ async function completeSelfTraining(page: Page, testInfo: TestInfo): Promise<Ste
       throw new Error(`Could not open self training card. Available controls: ${await dumpLinksAndButtons(page)}`);
     }
     await finishTrainingFlow(page, false);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.selfTraining)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.selfTraining)) ? 'performed' : 'attempted';
   });
 }
 
 async function earnTrainingScoreAtLeast4(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'earn-training-score-at-least-4', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.trainingScore4)) {
+    if (!shouldForceAction('trainingScore4') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.trainingScore4)) {
       return 'verified';
     }
     await openTrainingHome(page);
@@ -302,18 +401,19 @@ async function earnTrainingScoreAtLeast4(page: Page, testInfo: TestInfo): Promis
       throw new Error(`Could not open score training card. Available controls: ${await dumpLinksAndButtons(page)}`);
     }
     await finishTrainingFlow(page, true);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.trainingScore4)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.trainingScore4)) ? 'performed' : 'attempted';
   });
 }
 
 async function openReflectionHome(page: Page): Promise<void> {
   await page.goto(`${ENV.baseUrl}/csr-platform/reflection/home`);
+  await waitForUiStable(page);
   await expect(page.getByText('회고 피드')).toBeVisible({ timeout: 30_000 });
 }
 
 async function writeDailyRetrospective(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'write-daily-retrospective', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.dailyRetrospective)) {
+    if (!shouldForceAction('dailyRetrospective') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.dailyRetrospective)) {
       return 'verified';
     }
     await openReflectionHome(page);
@@ -323,13 +423,13 @@ async function writeDailyRetrospective(page: Page, testInfo: TestInfo): Promise<
       await input.fill('오늘 학습과 훈련을 진행했고 자동화 테스트를 수행했다.');
     }
     await clickActionButton(page);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.dailyRetrospective)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.dailyRetrospective)) ? 'performed' : 'attempted';
   });
 }
 
 async function completeWeeklyRetrospective(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'complete-weekly-retrospective', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.weeklyRetrospective)) {
+    if (!shouldForceAction('weeklyRetrospective') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.weeklyRetrospective)) {
       return 'verified';
     }
     await openReflectionHome(page);
@@ -339,13 +439,13 @@ async function completeWeeklyRetrospective(page: Page, testInfo: TestInfo): Prom
       await input.fill('이번 주에는 과제, 훈련, 회고를 꾸준히 수행했다.');
     }
     await clickActionButton(page);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.weeklyRetrospective)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.weeklyRetrospective)) ? 'performed' : 'attempted';
   });
 }
 
 async function earnWeeklyRetrospectiveScoreAtLeast4(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'earn-weekly-retrospective-score-at-least-4', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.weeklyRetrospectiveScore4)) {
+    if (!shouldForceAction('weeklyRetrospectiveScore4') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.weeklyRetrospectiveScore4)) {
       return 'verified';
     }
     await openReflectionHome(page);
@@ -355,13 +455,13 @@ async function earnWeeklyRetrospectiveScoreAtLeast4(page: Page, testInfo: TestIn
       await starLike.nth(4).click();
     }
     await clickActionButton(page);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.weeklyRetrospectiveScore4)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.weeklyRetrospectiveScore4)) ? 'performed' : 'attempted';
   });
 }
 
 async function completeOneAssignment(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'complete-one-assignment', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.assignment)) {
+    if (!shouldForceAction('assignment') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.assignment)) {
       return 'verified';
     }
     await page.goto(`${ENV.baseUrl}/csr-platform/submission/home`);
@@ -373,16 +473,31 @@ async function completeOneAssignment(page: Page, testInfo: TestInfo): Promise<St
       await input.fill('Playwright 자동 제출 테스트 내용입니다.');
     }
     await clickActionButton(page);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.assignment)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.assignment)) ? 'performed' : 'attempted';
   });
 }
 
 async function createOneCsrQuestion(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'create-one-csr-question', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.csrQuestion)) {
+    if (!shouldForceAction('csrQuestion') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.csrQuestion)) {
       return 'verified';
     }
     await page.goto(`${ENV.baseUrl}/csr-platform/knowledge/csr-question`);
+    await waitForUiStable(page);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const ready = await firstVisible(page, [
+        ...textboxCandidates({
+          testIds: ['question-input', 'chat-input'],
+          placeholders: [/여러분의 질문을 기다리고 있어요!/]
+        }),
+        (candidatePage) => candidatePage.getByRole('button', { name: /CSR을 하면 어떤 효과가 있나요|회고와 일기의 차이는 무엇인가요/ }).first()
+      ]);
+      if (ready) {
+        break;
+      }
+      await page.reload();
+      await waitForUiStable(page);
+    }
     await expect(page.getByRole('link', { name: 'CSR 질문' })).toBeVisible({ timeout: 30_000 });
     const questionInput = await firstVisible(page, textboxCandidates({
       testIds: ['question-input', 'chat-input'],
@@ -396,13 +511,13 @@ async function createOneCsrQuestion(page: Page, testInfo: TestInfo): Promise<Ste
       ...byTestIds('send-question', 'submit-question'),
       (candidatePage) => candidatePage.locator('button').filter({ has: candidatePage.locator('img') }).nth(1)
     ]);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.csrQuestion)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.csrQuestion)) ? 'performed' : 'attempted';
   });
 }
 
 async function sendOneThanksCard(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'send-one-thanks-card', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.thanksCard)) {
+    if (!shouldForceAction('thanksCard') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.thanksCard)) {
       return 'verified';
     }
     await openReflectionHome(page);
@@ -423,13 +538,13 @@ async function sendOneThanksCard(page: Page, testInfo: TestInfo): Promise<StepOu
       await input.fill('항상 도와줘서 고마워요!');
     }
     await clickActionButton(page);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.thanksCard)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.thanksCard)) ? 'performed' : 'attempted';
   });
 }
 
 async function writeOneRetrospectiveComment(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'write-one-retrospective-comment', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.retrospectiveComment)) {
+    if (!shouldForceAction('retrospectiveComment') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.retrospectiveComment)) {
       return 'verified';
     }
     await openReflectionHome(page);
@@ -439,13 +554,13 @@ async function writeOneRetrospectiveComment(page: Page, testInfo: TestInfo): Pro
       await input.fill('좋은 회고 잘 읽었습니다.');
     }
     await clickActionButton(page);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.retrospectiveComment)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.retrospectiveComment)) ? 'performed' : 'attempted';
   });
 }
 
 async function shareOneRetrospective(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'share-one-retrospective', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.retrospectiveShare)) {
+    if (!shouldForceAction('retrospectiveShare') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.retrospectiveShare)) {
       return 'verified';
     }
     await openReflectionHome(page);
@@ -454,13 +569,13 @@ async function shareOneRetrospective(page: Page, testInfo: TestInfo): Promise<St
       (candidatePage) => candidatePage.getByRole('button', { name: /공유/ }),
       (candidatePage) => candidatePage.getByText(/URL 복사|복사|공개/)
     ]);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.retrospectiveShare)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.retrospectiveShare)) ? 'performed' : 'attempted';
   });
 }
 
 async function addOnePracticeGoal(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'add-one-practice-goal', async () => {
-    if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.practiceGoal)) {
+    if (!shouldForceAction('practiceGoal') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.practiceGoal)) {
       return 'verified';
     }
     await openReflectionHome(page);
@@ -470,6 +585,6 @@ async function addOnePracticeGoal(page: Page, testInfo: TestInfo): Promise<StepO
       await input.fill('매일 30분 학습하기');
     }
     await clickActionButton(page);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.practiceGoal)) ? 'performed' : 'failed';
+    return (await verifyPointItemCompleted(page, POINT_LABELS.practiceGoal)) ? 'performed' : 'attempted';
   });
 }

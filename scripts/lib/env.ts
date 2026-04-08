@@ -18,7 +18,11 @@ export const ENV = {
   baseUrl: process.env.NEWRROW_BASE_URL ?? 'https://bssm.newrrow.com',
   dashboardPath: '/csr-platform/dashboard',
   storageStatePath: process.env.NEWRROW_STORAGE_STATE_PATH ?? path.join(rootDir, '.auth', 'storageState.json'),
-  artifactDir: process.env.NEWRROW_ARTIFACT_DIR ?? path.join(rootDir, 'artifacts')
+  artifactDir: process.env.NEWRROW_ARTIFACT_DIR ?? path.join(rootDir, 'artifacts'),
+  forceActionKeys: (process.env.NEWRROW_FORCE_ACTIONS ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)
 };
 
 export function getCredentials(): { email: string; password: string } {
