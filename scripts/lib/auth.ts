@@ -1,10 +1,11 @@
 import fs from 'node:fs';
 import { expect, type Browser, type Page } from '@playwright/test';
-import { ENV } from './env.js';
+import { ENV, getCredentials } from './env.js';
 
 async function fillLoginForm(page: Page): Promise<void> {
-  await page.getByRole('textbox', { name: /이메일 주소를 입력하세요\./ }).fill(ENV.email);
-  await page.getByRole('textbox', { name: /비밀번호를 입력하세요\./ }).fill(ENV.password);
+  const { email, password } = getCredentials();
+  await page.getByRole('textbox', { name: /이메일 주소를 입력하세요\./ }).fill(email);
+  await page.getByRole('textbox', { name: /비밀번호를 입력하세요\./ }).fill(password);
   await page.getByRole('button', { name: '로그인' }).click();
 }
 

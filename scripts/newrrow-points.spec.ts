@@ -2,7 +2,7 @@ import { test, expect, type Locator, type Page, type TestInfo } from '@playwrigh
 import { ENV, ensureRuntimeDirectories } from './lib/env.js';
 import { ensureStorageState } from './lib/auth.js';
 import { captureEvidence, logLine } from './lib/logging.js';
-import { clickFirstVisible } from './lib/selectors.js';
+import { actionButtonCandidates, bySelectors, byTestIds, clickFirstVisible, firstVisible, textboxCandidates } from './lib/selectors.js';
 
 type StepOutcome = 'verified' | 'performed' | 'skipped' | 'failed';
 
@@ -134,25 +134,18 @@ async function verifyPointItemCompleted(page: Page, labelText: string): Promise<
 }
 
 async function selectMeaningfulInput(page: Page): Promise<Locator | null> {
-  const candidates = [
-    page.getByRole('textbox', { name: /제목|이름|업무|내용|질문|댓글|회고|목표/i }).first(),
-    page.getByRole('textbox').first(),
-    page.locator('textarea').first(),
-    page.locator('input[type="text"]').first()
-  ];
-  for (const locator of candidates) {
-    if (await locator.count().catch(() => 0) && await locator.isVisible().catch(() => false)) {
-      return locator;
-    }
-  }
-  return null;
+  return firstVisible(
+    page,
+    textboxCandidates({
+      testIds: ['title', 'name', 'content', 'question', 'comment', 'goal', 'task-title', 'task-content'],
+      names: [/제목|이름|업무|내용|질문|댓글|회고|목표/i],
+      placeholders: [/업무를 등록해 주세요|여러분의 질문을 기다리고 있어요/i]
+    })
+  );
 }
 
 async function clickActionButton(page: Page): Promise<boolean> {
-  return clickFirstVisible(
-    page,
-    BUTTON_TEXTS.map((text) => (candidatePage: Page) => candidatePage.getByRole('button', { name: text }))
-  );
+  return clickFirstVisible(page, actionButtonCandidates(BUTTON_TEXTS, ['submit', 'save', 'create', 'add', 'complete', 'send', 'share']));
 }
 
 async function dumpLinksAndButtons(page: Page): Promise<string> {
@@ -172,7 +165,7 @@ async function maybeSkipIfAlreadyCompleted(page: Page, label: string): Promise<b
 
 async function openTaskPage(page: Page): Promise<void> {
   await page.goto(`${ENV.baseUrl}/working-station/tasks`);
-  await expect(page.getByText('할 일')).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole('link', { name: '할 일' })).toBeVisible({ timeout: 30_000 });
 }
 
 async function viewDashboardOnce(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
@@ -191,9 +184,15 @@ async function completeTodoOnce(page: Page, testInfo: TestInfo): Promise<StepOut
       return 'verified';
     }
     await openTaskPage(page);
-    const input = page.getByRole('textbox', { name: /업무를 등록해 주세요\./ }).first();
+    const input = await firstVisible(page, textboxCandidates({
+      testIds: ['task-input', 'task-title', 'task-content'],
+      placeholders: [/업무를 등록해 주세요\./]
+    }));
+    if (!input) {
+      throw new Error(`Todo input not found. Available controls: ${await dumpLinksAndButtons(page)}`);
+    }
     await input.fill(`Playwright 자동 등록 테스트 ${Date.now()}`);
-    await page.getByRole('button', { name: '추가' }).click();
+    await clickActionButton(page);
     return (await verifyPointItemCompleted(page, POINT_LABELS.todo)) ? 'performed' : 'failed';
   });
 }
@@ -220,8 +219,40 @@ async function createTimetableOnce(page: Page, testInfo: TestInfo): Promise<Step
 
 async function openTrainingHome(page: Page): Promise<void> {
   await page.goto(`${ENV.baseUrl}/csr-platform/training/home`);
-  await expect(page.getByText('훈련')).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole('link', { name: '훈련 기본 과정' })).toBeVisible({ timeout: 30_000 });
   await closeModalIfPresent(page);
+}
+
+async function clickTrainingCard(page: Page, mode: 'assigned' | 'self' | 'score'): Promise<boolean> {
+  const specific = {
+    assigned: /진행중|지정|오늘 해야 할 훈련/i,
+    self: /나만의 소통 훈련 만들기|소통|전략|협업/i,
+    score: /소통|전략|협업|면접훈련/i
+  }[mode];
+  const card = page.getByRole('button').filter({ hasText: specific }).first();
+  if (await card.isVisible().catch(() => false)) {
+    await card.click();
+    return true;
+  }
+  const fallback = page.getByRole('button').filter({ hasText: /훈련|소통|전략|협업|진행중/ }).first();
+  if (await fallback.isVisible().catch(() => false)) {
+    await fallback.click();
+    return true;
+  }
+  return false;
+}
+
+async function finishTrainingFlow(page: Page, requireHighScore: boolean): Promise<void> {
+  await clickActionButton(page);
+  if (requireHighScore) {
+    const starButtons = page.locator('button').filter({ has: page.locator('svg') });
+    const starCount = await starButtons.count().catch(() => 0);
+    if (starCount >= 5) {
+      await starButtons.nth(4).click().catch(() => undefined);
+    }
+  }
+  await clickActionButton(page);
+  await page.keyboard.press('Escape').catch(() => undefined);
 }
 
 async function clickFirstTrainingCard(page: Page): Promise<boolean> {
@@ -233,27 +264,16 @@ async function clickFirstTrainingCard(page: Page): Promise<boolean> {
   return false;
 }
 
-async function finishTrainingFlow(page: Page): Promise<void> {
-  await clickActionButton(page);
-  const starButtons = page.locator('button').filter({ has: page.locator('svg') });
-  const starCount = await starButtons.count().catch(() => 0);
-  if (starCount >= 5) {
-    await starButtons.nth(4).click().catch(() => undefined);
-  }
-  await clickActionButton(page);
-  await page.keyboard.press('Escape').catch(() => undefined);
-}
-
 async function completeAssignedTraining(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'complete-assigned-training', async () => {
     if (await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.assignedTraining)) {
       return 'verified';
     }
     await openTrainingHome(page);
-    if (!(await clickFirstTrainingCard(page))) {
+    if (!(await clickTrainingCard(page, 'assigned'))) {
       throw new Error(`Could not open training card. Available controls: ${await dumpLinksAndButtons(page)}`);
     }
-    await finishTrainingFlow(page);
+    await finishTrainingFlow(page, false);
     return (await verifyPointItemCompleted(page, POINT_LABELS.assignedTraining)) ? 'performed' : 'failed';
   });
 }
@@ -264,8 +284,10 @@ async function completeSelfTraining(page: Page, testInfo: TestInfo): Promise<Ste
       return 'verified';
     }
     await openTrainingHome(page);
-    await clickFirstTrainingCard(page);
-    await finishTrainingFlow(page);
+    if (!(await clickTrainingCard(page, 'self'))) {
+      throw new Error(`Could not open self training card. Available controls: ${await dumpLinksAndButtons(page)}`);
+    }
+    await finishTrainingFlow(page, false);
     return (await verifyPointItemCompleted(page, POINT_LABELS.selfTraining)) ? 'performed' : 'failed';
   });
 }
@@ -276,8 +298,10 @@ async function earnTrainingScoreAtLeast4(page: Page, testInfo: TestInfo): Promis
       return 'verified';
     }
     await openTrainingHome(page);
-    await clickFirstTrainingCard(page);
-    await finishTrainingFlow(page);
+    if (!(await clickTrainingCard(page, 'score'))) {
+      throw new Error(`Could not open score training card. Available controls: ${await dumpLinksAndButtons(page)}`);
+    }
+    await finishTrainingFlow(page, true);
     return (await verifyPointItemCompleted(page, POINT_LABELS.trainingScore4)) ? 'performed' : 'failed';
   });
 }
@@ -359,9 +383,19 @@ async function createOneCsrQuestion(page: Page, testInfo: TestInfo): Promise<Ste
       return 'verified';
     }
     await page.goto(`${ENV.baseUrl}/csr-platform/knowledge/csr-question`);
-    await expect(page.getByText('CSR 질문')).toBeVisible({ timeout: 30_000 });
-    await page.getByRole('textbox', { name: /여러분의 질문을 기다리고 있어요!/ }).fill('CSR 활동을 꾸준히 하기 위한 방법은 무엇인가요?');
-    await page.locator('button').filter({ has: page.locator('img') }).nth(1).click();
+    await expect(page.getByRole('link', { name: 'CSR 질문' })).toBeVisible({ timeout: 30_000 });
+    const questionInput = await firstVisible(page, textboxCandidates({
+      testIds: ['question-input', 'chat-input'],
+      placeholders: [/여러분의 질문을 기다리고 있어요!/]
+    }));
+    if (!questionInput) {
+      throw new Error(`CSR question input not found. Available controls: ${await dumpLinksAndButtons(page)}`);
+    }
+    await questionInput.fill('CSR 활동을 꾸준히 하기 위한 방법은 무엇인가요?');
+    await clickFirstVisible(page, [
+      ...byTestIds('send-question', 'submit-question'),
+      (candidatePage) => candidatePage.locator('button').filter({ has: candidatePage.locator('img') }).nth(1)
+    ]);
     return (await verifyPointItemCompleted(page, POINT_LABELS.csrQuestion)) ? 'performed' : 'failed';
   });
 }
@@ -374,6 +408,16 @@ async function sendOneThanksCard(page: Page, testInfo: TestInfo): Promise<StepOu
     await openReflectionHome(page);
     await page.getByRole('button', { name: /감사 카드 보관함/ }).click();
     await clickActionButton(page);
+    const recipient = await firstVisible(page, [
+      ...byTestIds('recipient', 'recipient-item', 'user-item'),
+      (candidatePage) => candidatePage.getByRole('checkbox').first(),
+      (candidatePage) => candidatePage.getByRole('radio').first(),
+      (candidatePage) => candidatePage.getByRole('button').filter({ hasText: /학생|교사|허동운|방세준|이준호/ }).first(),
+      ...bySelectors('[data-value]', '[role="option"]', 'li')
+    ]);
+    if (recipient) {
+      await recipient.click().catch(() => undefined);
+    }
     const input = await selectMeaningfulInput(page);
     if (input) {
       await input.fill('항상 도와줘서 고마워요!');
