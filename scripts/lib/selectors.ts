@@ -15,12 +15,22 @@ export async function firstVisible(page: Page, factories: LocatorFactory[]): Pro
 }
 
 export async function clickFirstVisible(page: Page, factories: LocatorFactory[]): Promise<boolean> {
-  const locator = await firstVisible(page, factories);
-  if (!locator) {
-    return false;
+  for (const factory of factories) {
+    const locator = factory(page).first();
+    if (!await locator.count().catch(() => 0)) {
+      continue;
+    }
+    if (!await locator.isVisible().catch(() => false)) {
+      continue;
+    }
+    const enabled = await locator.isEnabled().catch(() => true);
+    if (!enabled) {
+      continue;
+    }
+    await locator.click({ timeout: 5_000 });
+    return true;
   }
-  await locator.click();
-  return true;
+  return false;
 }
 
 export function byTestIds(...testIds: string[]): LocatorFactory[] {
