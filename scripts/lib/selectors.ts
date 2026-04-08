@@ -15,12 +15,48 @@ export async function firstVisible(page: Page, factories: LocatorFactory[]): Pro
 }
 
 export async function clickFirstVisible(page: Page, factories: LocatorFactory[]): Promise<boolean> {
-  const locator = await firstVisible(page, factories);
-  if (!locator) {
-    return false;
+  for (const factory of factories) {
+    const locator = factory(page).first();
+    if (!await locator.count().catch(() => 0)) {
+      continue;
+    }
+    if (!await locator.isVisible().catch(() => false)) {
+      continue;
+    }
+    const enabled = await locator.isEnabled().catch(() => true);
+    if (!enabled) {
+      continue;
+    }
+    await locator.click({ timeout: 5_000 });
+    return true;
   }
-  await locator.click();
-  return true;
+  return false;
+}
+
+export function byTestIds(...testIds: string[]): LocatorFactory[] {
+  return testIds.map((testId) => (page) => page.getByTestId(testId));
+}
+
+export function bySelectors(...selectors: string[]): LocatorFactory[] {
+  return selectors.map((selector) => (page) => page.locator(selector));
+}
+
+export function textboxCandidates(options: { testIds?: string[]; names?: RegExp[]; placeholders?: RegExp[] } = {}): LocatorFactory[] {
+  return [
+    ...(options.testIds ? byTestIds(...options.testIds) : []),
+    ...((options.names ?? []).map((name) => (page: Page) => page.getByRole('textbox', { name }))),
+    ...((options.placeholders ?? []).map((placeholder) => (page: Page) => page.getByPlaceholder(placeholder))),
+    (page: Page) => page.locator('textarea'),
+    (page: Page) => page.locator('input[type="text"]')
+  ];
+}
+
+export function actionButtonCandidates(texts: RegExp[], testIds: string[] = []): LocatorFactory[] {
+  return [
+    ...byTestIds(...testIds),
+    ...texts.map((text) => (page: Page) => page.getByRole('button', { name: text })),
+    ...texts.map((text) => (page: Page) => page.getByText(text))
+  ];
 }
 
 export function buttonByTexts(...texts: RegExp[]): LocatorFactory[] {
