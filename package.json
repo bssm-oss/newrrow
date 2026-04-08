@@ -1,0 +1,18 @@
+{
+  "name": "newrrow-playwright-automation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:newrrow-points": "playwright test scripts/newrrow-points.spec.ts",
+    "test:newrrow-points:headed": "playwright test scripts/newrrow-points.spec.ts --headed",
+    "typecheck": "tsc --noEmit",
+    "codegen": "playwright codegen https://bssm.newrrow.com/csr-platform/dashboard"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.54.2",
+    "@types/node": "^24.5.2",
+    "dotenv": "^16.6.1",
+    "typescript": "^5.9.2"
+  }
+}
