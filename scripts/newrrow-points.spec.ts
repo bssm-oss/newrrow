@@ -79,7 +79,7 @@ async function runActionStep(page: Page, testInfo: TestInfo, stepName: string, b
 
 async function goDashboard(page: Page): Promise<void> {
   await page.goto(`${ENV.baseUrl}${ENV.dashboardPath}`);
-  await expect(page.getByText('대시보드')).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole('link', { name: '대시보드' })).toBeVisible({ timeout: 30_000 });
 }
 
 async function closeModalIfPresent(page: Page): Promise<void> {

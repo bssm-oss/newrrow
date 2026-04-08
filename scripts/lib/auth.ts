@@ -8,6 +8,16 @@ async function fillLoginForm(page: Page): Promise<void> {
   await page.getByRole('button', { name: '로그인' }).click();
 }
 
+async function waitForDashboard(page: Page, timeout: number): Promise<boolean> {
+  try {
+    await page.waitForURL(/bssm\.newrrow\.com\/csr-platform\/dashboard/, { timeout });
+    await expect(page.getByRole('link', { name: '대시보드' })).toBeVisible({ timeout: Math.min(timeout, 30_000) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function createOrRefreshStorageState(browser: Browser): Promise<void> {
   const context = await browser.newContext();
   const page = await context.newPage();
@@ -17,8 +27,15 @@ export async function createOrRefreshStorageState(browser: Browser): Promise<voi
     await fillLoginForm(page);
   }
 
-  await page.waitForURL(/bssm\.newrrow\.com\/csr-platform\/dashboard/, { timeout: 60_000 });
-  await expect(page.getByText('대시보드')).toBeVisible({ timeout: 30_000 });
+  const autoLoginWorked = await waitForDashboard(page, 20_000);
+  if (!autoLoginWorked) {
+    console.log('[newrrow-points] Automatic login did not finish. Waiting for manual login in the headed browser...');
+    const manualLoginWorked = await waitForDashboard(page, 120_000);
+    if (!manualLoginWorked) {
+      throw new Error('Unable to establish an authenticated Newrrow dashboard session. Complete login manually in the opened browser or provide a valid storageState file.');
+    }
+  }
+
   await context.storageState({ path: ENV.storageStatePath });
   await context.close();
 }
