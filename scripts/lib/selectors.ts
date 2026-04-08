@@ -23,6 +23,32 @@ export async function clickFirstVisible(page: Page, factories: LocatorFactory[])
   return true;
 }
 
+export function byTestIds(...testIds: string[]): LocatorFactory[] {
+  return testIds.map((testId) => (page) => page.getByTestId(testId));
+}
+
+export function bySelectors(...selectors: string[]): LocatorFactory[] {
+  return selectors.map((selector) => (page) => page.locator(selector));
+}
+
+export function textboxCandidates(options: { testIds?: string[]; names?: RegExp[]; placeholders?: RegExp[] } = {}): LocatorFactory[] {
+  return [
+    ...(options.testIds ? byTestIds(...options.testIds) : []),
+    ...((options.names ?? []).map((name) => (page: Page) => page.getByRole('textbox', { name }))),
+    ...((options.placeholders ?? []).map((placeholder) => (page: Page) => page.getByPlaceholder(placeholder))),
+    (page: Page) => page.locator('textarea'),
+    (page: Page) => page.locator('input[type="text"]')
+  ];
+}
+
+export function actionButtonCandidates(texts: RegExp[], testIds: string[] = []): LocatorFactory[] {
+  return [
+    ...byTestIds(...testIds),
+    ...texts.map((text) => (page: Page) => page.getByRole('button', { name: text })),
+    ...texts.map((text) => (page: Page) => page.getByText(text))
+  ];
+}
+
 export function buttonByTexts(...texts: RegExp[]): LocatorFactory[] {
   return texts.map((text) => (page) => page.getByRole('button', { name: text }));
 }

@@ -17,11 +17,16 @@ export const ENV = {
   rootDir,
   baseUrl: process.env.NEWRROW_BASE_URL ?? 'https://bssm.newrrow.com',
   dashboardPath: '/csr-platform/dashboard',
-  email: required('NEWRROW_EMAIL'),
-  password: required('NEWRROW_PASSWORD'),
   storageStatePath: process.env.NEWRROW_STORAGE_STATE_PATH ?? path.join(rootDir, '.auth', 'storageState.json'),
   artifactDir: process.env.NEWRROW_ARTIFACT_DIR ?? path.join(rootDir, 'artifacts')
 };
+
+export function getCredentials(): { email: string; password: string } {
+  return {
+    email: required('NEWRROW_EMAIL'),
+    password: required('NEWRROW_PASSWORD')
+  };
+}
 
 export function ensureRuntimeDirectories(): void {
   fs.mkdirSync(path.dirname(ENV.storageStatePath), { recursive: true });
