@@ -1,6 +1,6 @@
 import { test, expect, type Locator, type Page, type TestInfo } from '@playwright/test';
 import { ENV, ensureRuntimeDirectories } from './lib/env.js';
-import { ensureStorageState } from './lib/auth.js';
+import { ensureAuthenticatedPage, ensureStorageState } from './lib/auth.js';
 import { captureEvidence, logLine } from './lib/logging.js';
 import { actionButtonCandidates, bySelectors, byTestIds, clickFirstVisible, firstVisible, textboxCandidates } from './lib/selectors.js';
 
@@ -112,6 +112,12 @@ async function smartPressNext(page: Page): Promise<boolean> {
 async function goDashboard(page: Page): Promise<void> {
   await page.goto(`${ENV.baseUrl}${ENV.dashboardPath}`);
   await waitForUiStable(page);
+  const dashboardVisible = await page.getByRole('link', { name: '대시보드' }).isVisible().catch(() => false);
+  if (!dashboardVisible) {
+    await ensureAuthenticatedPage(page);
+    await page.goto(`${ENV.baseUrl}${ENV.dashboardPath}`);
+    await waitForUiStable(page);
+  }
   await expect(page.getByRole('link', { name: '대시보드' })).toBeVisible({ timeout: 30_000 });
 }
 
@@ -455,17 +461,26 @@ async function clickFirstTrainingCard(page: Page): Promise<boolean> {
   return false;
 }
 
+async function runTrainingAction(page: Page, mode: 'assigned' | 'self' | 'score', label: string, requireHighScore: boolean): Promise<StepOutcome> {
+  const trainingPage = await page.context().newPage();
+  try {
+    await openTrainingHome(trainingPage);
+    if (!(await clickTrainingCard(trainingPage, mode))) {
+      return 'attempted';
+    }
+    await finishTrainingFlow(trainingPage, requireHighScore);
+    return (await verifyPointItemCompleted(trainingPage, label)) ? 'performed' : 'attempted';
+  } finally {
+    await trainingPage.close().catch(() => undefined);
+  }
+}
+
 async function completeAssignedTraining(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'complete-assigned-training', async () => {
     if (!shouldForceAction('assignedTraining') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.assignedTraining)) {
       return 'verified';
     }
-    await openTrainingHome(page);
-    if (!(await clickTrainingCard(page, 'assigned'))) {
-      throw new Error(`Could not open training card. Available controls: ${await dumpLinksAndButtons(page)}`);
-    }
-    await finishTrainingFlow(page, false);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.assignedTraining)) ? 'performed' : 'attempted';
+    return runTrainingAction(page, 'assigned', POINT_LABELS.assignedTraining, false);
   });
 }
 
@@ -474,12 +489,7 @@ async function completeSelfTraining(page: Page, testInfo: TestInfo): Promise<Ste
     if (!shouldForceAction('selfTraining') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.selfTraining)) {
       return 'verified';
     }
-    await openTrainingHome(page);
-    if (!(await clickTrainingCard(page, 'self'))) {
-      throw new Error(`Could not open self training card. Available controls: ${await dumpLinksAndButtons(page)}`);
-    }
-    await finishTrainingFlow(page, false);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.selfTraining)) ? 'performed' : 'attempted';
+    return runTrainingAction(page, 'self', POINT_LABELS.selfTraining, false);
   });
 }
 
@@ -488,12 +498,7 @@ async function earnTrainingScoreAtLeast4(page: Page, testInfo: TestInfo): Promis
     if (!shouldForceAction('trainingScore4') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.trainingScore4)) {
       return 'verified';
     }
-    await openTrainingHome(page);
-    if (!(await clickTrainingCard(page, 'score'))) {
-      throw new Error(`Could not open score training card. Available controls: ${await dumpLinksAndButtons(page)}`);
-    }
-    await finishTrainingFlow(page, true);
-    return (await verifyPointItemCompleted(page, POINT_LABELS.trainingScore4)) ? 'performed' : 'attempted';
+    return runTrainingAction(page, 'score', POINT_LABELS.trainingScore4, true);
   });
 }
 
@@ -503,20 +508,39 @@ async function openReflectionHome(page: Page): Promise<void> {
   await expect(page.getByText('회고 피드')).toBeVisible({ timeout: 30_000 });
 }
 
+async function openDailyReflectionEntry(page: Page): Promise<void> {
+  const opened = await smartClick(page, [
+    ...byTestIds('daily-reflection-nudge', 'daily-reflection', 'daily-reflection-entry'),
+    (candidatePage) => candidatePage.getByRole('button', { name: /아직 오늘의 회고를 작성하지 않았어요/ }),
+    (candidatePage) => candidatePage.getByRole('button', { name: /오늘의 회고 작성을 완료하셨어요!/ }),
+    (candidatePage) => candidatePage.getByRole('button').filter({ hasText: /^일일 회고/ }).nth(0),
+    (candidatePage) => candidatePage.getByText(/^일일 회고$/).locator('..').nth(0)
+  ]);
+
+  if (!opened) {
+    throw new Error(`Daily reflection entry not found. Visible UI: ${JSON.stringify(await collectVisibleButtonsAndLinks(page))}`);
+  }
+
+  await waitForUiStable(page);
+}
+
+async function confirmReflectionStartIfNeeded(page: Page): Promise<void> {
+  await smartClick(page, [
+    ...byTestIds('confirm', 'confirm-date', 'open-daily-reflection'),
+    (candidatePage) => candidatePage.getByRole('button', { name: /^확인$/ }),
+    (candidatePage) => candidatePage.getByText(/^확인$/)
+  ]).catch(() => undefined);
+  await waitForUiStable(page);
+}
+
 async function writeDailyRetrospective(page: Page, testInfo: TestInfo): Promise<StepOutcome> {
   return runActionStep(page, testInfo, 'write-daily-retrospective', async () => {
     if (!shouldForceAction('dailyRetrospective') && await maybeSkipIfAlreadyCompleted(page, POINT_LABELS.dailyRetrospective)) {
       return 'verified';
     }
     await openReflectionHome(page);
-    await page.getByRole('button', { name: /일일 회고/ }).click();
-    await waitForUiStable(page);
-    await smartClick(page, [
-      ...byTestIds('confirm', 'confirm-date', 'open-daily-reflection'),
-      (candidatePage) => candidatePage.getByRole('button', { name: /^확인$/ }),
-      (candidatePage) => candidatePage.getByText(/^확인$/)
-    ]).catch(() => undefined);
-    await waitForUiStable(page);
+    await openDailyReflectionEntry(page);
+    await confirmReflectionStartIfNeeded(page);
     const input = await selectMeaningfulInput(page);
     if (input) {
       await input.fill('오늘 학습과 훈련을 진행했고 자동화 테스트를 수행했다.');
@@ -677,7 +701,8 @@ async function shareOneRetrospective(page: Page, testInfo: TestInfo): Promise<St
       return 'verified';
     }
     await openReflectionHome(page);
-    await page.getByRole('button', { name: /오늘의 회고 작성을 완료하셨어요!/ }).click();
+    await openDailyReflectionEntry(page);
+    await confirmReflectionStartIfNeeded(page);
     await clickFirstVisible(page, [
       (candidatePage) => candidatePage.getByRole('button', { name: /공유/ }),
       (candidatePage) => candidatePage.getByText(/URL 복사|복사|공개/)
@@ -692,12 +717,17 @@ async function addOnePracticeGoal(page: Page, testInfo: TestInfo): Promise<StepO
       return 'verified';
     }
     await openReflectionHome(page);
-    await page.getByRole('button', { name: /오늘의 회고 작성을 완료하셨어요!/ }).click();
+    await openDailyReflectionEntry(page);
+    await confirmReflectionStartIfNeeded(page);
     const input = await selectMeaningfulInput(page);
-    if (input) {
-      await input.fill('매일 30분 학습하기');
+    if (!input) {
+      return 'attempted';
     }
-    await clickActionButton(page);
+    await input.fill('매일 30분 학습하기');
+    const saved = await clickActionButton(page);
+    if (!saved) {
+      return 'attempted';
+    }
     return (await verifyPointItemCompleted(page, POINT_LABELS.practiceGoal)) ? 'performed' : 'attempted';
   });
 }

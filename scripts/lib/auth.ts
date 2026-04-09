@@ -9,6 +9,10 @@ async function fillLoginForm(page: Page): Promise<void> {
   await page.getByRole('button', { name: '로그인' }).click();
 }
 
+function isLoginScreen(page: Page): Promise<boolean> {
+  return page.getByRole('button', { name: '로그인' }).isVisible().catch(() => false);
+}
+
 async function waitForDashboard(page: Page, timeout: number): Promise<boolean> {
   try {
     await page.waitForURL(/bssm\.newrrow\.com\/csr-platform\/dashboard/, { timeout });
@@ -39,6 +43,25 @@ export async function createOrRefreshStorageState(browser: Browser): Promise<voi
 
   await context.storageState({ path: ENV.storageStatePath });
   await context.close();
+}
+
+export async function ensureAuthenticatedPage(page: Page): Promise<void> {
+  const onLoginScreen = await isLoginScreen(page);
+  if (!onLoginScreen) {
+    return;
+  }
+
+  await fillLoginForm(page);
+  const loginWorked = await waitForDashboard(page, 30_000);
+  if (!loginWorked) {
+    console.log('[newrrow-points] Automatic login did not finish on current page. Waiting for manual login in the headed browser...');
+    const manualLoginWorked = await waitForDashboard(page, 120_000);
+    if (!manualLoginWorked) {
+      throw new Error('Unable to establish an authenticated Newrrow dashboard session from the current page. Complete login manually in the opened browser.');
+    }
+  }
+
+  await page.context().storageState({ path: ENV.storageStatePath });
 }
 
 export async function ensureStorageState(browser: Browser): Promise<void> {
